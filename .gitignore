@@ -1,0 +1,47 @@
+# === SECRETS (never commit) ===
+config.ini
+*.ini
+!config.example.ini
+
+# === BUILD ARTIFACTS ===
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# === VIRTUAL ENV ===
+venv/
+env/
+.venv/
+ENV/
+
+# === DATA / OUTPUT FILES ===
+*.xlsx
+*.xls
+*.csv
+*.dat
+*.pkl
+*.pickle
+*.json
+*.log
+
+# Keep these:
+!requirements.txt
+!config.example.ini
+!ami_loc.xlsx
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Temp files ===
+tempCodeRunnerFile.py
