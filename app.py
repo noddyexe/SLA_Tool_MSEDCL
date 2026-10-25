@@ -22,14 +22,27 @@ class LoginApp:
         self.root.configure(bg='#2196F3')
         self.root.resizable(False, False)
         
-        cfg = get_config()['LOGIN']
+        # cfg = get_config()['LOGIN']
+        # self.valid_credentials = {
+        #     "mcl": cfg['mcl'],
+        #     "admin": cfg['admin'],
+        #     "user": cfg['user'],
+        #     "f": cfg['f'],
+        # }
+        # self.expiration_date = cfg['expiration_date']
+
+
+
+        # Hardcoded credentials 
         self.valid_credentials = {
-            "mcl": cfg['mcl'],
-            "admin": cfg['admin'],
-            "user": cfg['user'],
-            "f": cfg['f'],
-        }
-        self.expiration_date = cfg['expiration_date']
+                    "mcl": "mcl@123",
+                    "admin": "admin@123",
+                    "user": "user@123",
+                    "f": "f"
+                }
+                
+                # Expiration date (format: DDMMYYYY)
+        self.expiration_date = "01112026"
         
         self.create_login_ui()
 
