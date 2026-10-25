@@ -6,12 +6,12 @@
 
 ## What this project does (plain English)
 
-Electricity distribution companies install **smart meters** at consumers' homes. These meters send data back to a central server every day — billing readings, load profiles, alarm events, etc. The company has **SLA (Service Level Agreement)** targets: *"95 % of meters must send billing data within 72 hours"*, *"at least 98 % of daily load profiles must arrive by 24 hours"*, and so on.
+Electricity distribution companies install **smart meters** at consumers' homes. These meters send data back to a central server every day — billing readings, load profiles, alarm events, etc. The company has **SLA (Service Level Agreement)** targets: *"99.5 % of meters must send billing data within 72 hours"*, *"at least 99.5 % of daily load profiles must arrive by 24 hours"*, and so on.
 
 Producing a monthly SLA report used to mean:
 - running the same SQL queries every month
 - pasting the results into Excel by hand
-- cross-checking which meters were on holiday, faulty, or removed from service
+- cross-checking which meters were on burnt, faulty, or removed from field
 
 **This tool automates all of that.** A user logs in, picks a date range, clicks **Run**, and gets a ready-to-share Excel workbook with per-HES summaries, per-SDO summaries, and raw data sheets — including the exclusions (disconnected meters, meter-to-meter swaps, power-off events) that make the SLA numbers *fair*.
 
@@ -35,7 +35,7 @@ All modules are wrapped in a **Tkinter** GUI with live log output, **Stop** butt
 
 - **Language:** Python 3.10+
 - **GUI:** Tkinter / ttk
-- **Databases:** PostgreSQL (four separate DBs: SLA, MDM, HES, RC_DC)
+- **Databases:** PostgreSQL (four separate DBs: SLA, MDM, HES)
 - **DB driver:** `psycopg2`
 - **Data processing:** `pandas`
 - **Excel I/O:** `openpyxl`, `xlsxwriter`
