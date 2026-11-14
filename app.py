@@ -42,7 +42,7 @@ class LoginApp:
                 }
                 
                 # Expiration date (format: DDMMYYYY)
-        self.expiration_date = "01112026"
+        self.expiration_date = "01122026"
         
         self.create_login_ui()
 
