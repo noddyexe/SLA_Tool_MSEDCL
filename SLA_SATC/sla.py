@@ -1013,7 +1013,7 @@ class SLAExtractionApp:
         LEFT JOIN (
             SELECT hes_name, time_stamp, meter_number, bill_date, server_time, sla_id
             FROM unified_hes.uni_bill_data
-            where bill_date >= '2026-09-01' and bill_date < '2026-09-02'
+            where bill_date >= '2026-10-01' and bill_date < '2026-10-02'
             and((server_time >= '{date1_start}' AND server_time < '{date1_end}')
                OR (server_time >= '{date2_start}' AND server_time < '{date2_end}'))
         ) b ON cm.meterno = b.meter_number
@@ -1497,7 +1497,7 @@ ORDER BY
               AND p.request_time >= '{from_date}'
               AND p.request_time < '{query_to_date}'
               AND p.success_flag = 't'
-              AND rd.status = 'S'
+              AND rd.status in ('S','NA')
               AND rd.success_time IS NOT NULL
               AND rd.first_try_time IS NOT NULL
               AND p.request_time IS NOT NULL
@@ -1911,22 +1911,31 @@ ORDER BY
             if k not in out:
                 out[k] = rec
         return out
+
+
+
     
     def _build_exclusion_lookup(self, meter_list, pdc_df, sm_to_sm_df, non_opp_df, power_off_df, from_date):
-        """Classifies every unique meter ONCE with the exact same rules and priority."""
-        power_off_first = self._first_record_map(power_off_df, 'meterno')
-        result = {}
-        
-        if not self.exclusion_enabled:
-            for m in meter_list:
-                rec = power_off_first.get(m)
-                result[m] = ('Power_OFF', rec) if rec is not None else ('-', None)
-            return result
-        
-        pdc_first = self._first_record_map(pdc_df, 'meterno')
+        """Classifies every unique meter ONCE with the exact same rules and priority.
+    
+        NOTE: SM_SM mapping is applied identically whether exclusion is ENABLED or
+        DISABLED. When exclusion is DISABLED we only skip PD and Non_Opp mapping.
+        """
+        po_key_col = 'meter_number' if (power_off_df is not None and not power_off_df.empty
+                                        and 'meter_number' in power_off_df.columns) else 'meterno'
+        power_off_first = self._first_record_map(power_off_df, po_key_col)
+    
+        # --- SM_SM lookup is ALWAYS built (regardless of exclusion flag) ---
         sm_first = self._first_record_map(sm_to_sm_df, 'meter_serial_number')
-        non_opp_first = self._first_record_map(non_opp_df, 'meter_serial_number')
-        
+    
+        # --- PD / Non_Opp lookups are only built when exclusion is ENABLED ---
+        if self.exclusion_enabled:
+            pdc_first = self._first_record_map(pdc_df, 'meterno')
+            non_opp_first = self._first_record_map(non_opp_df, 'meter_serial_number')
+        else:
+            pdc_first = {}
+            non_opp_first = {}
+    
         from_date_obj = datetime.datetime.strptime(from_date, "%Y-%m-%d")
         if from_date_obj.month == 12:
             month_end = datetime.datetime(from_date_obj.year + 1, 1, 1) - datetime.timedelta(days=1)
@@ -1934,13 +1943,18 @@ ORDER BY
             month_end = datetime.datetime(from_date_obj.year, from_date_obj.month + 1, 1) - datetime.timedelta(days=1)
         month_end_with_time = month_end.replace(hour=23, minute=59, second=59)
         month_start_with_time = from_date_obj.replace(hour=0, minute=0, second=0)
-        
+    
+        result = {}
+    
         for m in meter_list:
-            rec = pdc_first.get(m)
-            if rec is not None:
-                result[m] = ('PD', rec)
-                continue
-            
+            # ---- Priority 1: PD (only when exclusion ENABLED) ----
+            if self.exclusion_enabled:
+                rec = pdc_first.get(m)
+                if rec is not None:
+                    result[m] = ('PD', rec)
+                    continue
+    
+            # ---- Priority 2: SM_SM (ALWAYS applied, same logic as YES) ----
             rec = sm_first.get(m)
             if rec is not None:
                 ticket_status = rec.get('ticket_status', '')
@@ -1957,39 +1971,48 @@ ORDER BY
                 elif ticket_status == 'OPEN':
                     result[m] = ('SM_SM', rec)
                     continue
-            
-            rec = non_opp_first.get(m)
-            if rec is not None:
-                ticket_status = rec.get('ticket_status', '')
-                if ticket_status == 'CLOSED':
-                    closed_time = rec.get('closed_time', '')
-                    if closed_time and pd.notna(closed_time):
-                        try:
-                            closed_time_dt = pd.to_datetime(closed_time)
-                            if month_start_with_time <= closed_time_dt <= month_end_with_time:
-                                result[m] = ('Non_Opp', rec)
-                                continue
-                        except Exception:
-                            pass
-                elif ticket_status == 'OPEN':
-                    result[m] = ('Non_Opp', rec)
-                    continue
-            
+    
+            # ---- Priority 3: Non_Opp (only when exclusion ENABLED) ----
+            if self.exclusion_enabled:
+                rec = non_opp_first.get(m)
+                if rec is not None:
+                    ticket_status = rec.get('ticket_status', '')
+                    if ticket_status == 'CLOSED':
+                        closed_time = rec.get('closed_time', '')
+                        if closed_time and pd.notna(closed_time):
+                            try:
+                                closed_time_dt = pd.to_datetime(closed_time)
+                                if month_start_with_time <= closed_time_dt <= month_end_with_time:
+                                    result[m] = ('Non_Opp', rec)
+                                    continue
+                            except Exception:
+                                pass
+                    elif ticket_status == 'OPEN':
+                        result[m] = ('Non_Opp', rec)
+                        continue
+    
+            # ---- Priority 4: Power_OFF ----
             rec = power_off_first.get(m)
             if rec is not None:
                 result[m] = ('Power_OFF', rec)
             else:
                 result[m] = ('-', None)
-        
+    
         return result
+
+
+
+
     
     def _power_off_count_lookup(self, power_off_data):
-        """{meter: power_off_count}"""
+        """{meter: power_off_count}. FIX: power OFF file uses 'meter_number'."""
         out = {}
-        if power_off_data is None or power_off_data.empty or \
-           'meterno' not in power_off_data.columns or 'power_off_exceptions_count' not in power_off_data.columns:
+        if power_off_data is None or power_off_data.empty:
             return out
-        keys = _to_str(power_off_data['meterno']).tolist()
+        key_col = 'meter_number' if 'meter_number' in power_off_data.columns else 'meterno'
+        if key_col not in power_off_data.columns or 'power_off_exceptions_count' not in power_off_data.columns:
+            return out
+        keys = _to_str(power_off_data[key_col]).tolist()
         counts = power_off_data['power_off_exceptions_count'].astype(object).tolist()
         for k, c in zip(keys, counts):
             if k:
@@ -2135,15 +2158,39 @@ ORDER BY
         
         poc = per_row(po_map, 0).astype(float)
         
-        with np.errstate(divide='ignore', invalid='ignore'):
-            base_blp = ip * nod
-            x = base_blp - poc
-            blp_pof = np.where(0 > x, 0.0, x)
-            y = np.where(ip > 0, nod - poc / ip, nod)
-            dlp_pof = np.where(0 > y, 0.0, y)
-        pof = is_po & (poc > 0)
-        blp_tg = np.where(excl, 0.0, np.where(pof, blp_pof, base_blp))
-        dlp_tg = np.where(excl, 0.0, np.where(pof, dlp_pof, float(nod)))
+        # =====================================================================
+        # FIX: exact logic requested for BLP_Tg and DLP_Tg
+        # =====================================================================
+        blp_tg = np.zeros(n, dtype=float)
+        dlp_tg = np.zeros(n, dtype=float)
+        
+        for i in range(n):
+            ex_type = typ[i]
+            po_count = poc[i]
+            ip_val = ip[i]
+            
+            if ex_type == 'Power_OFF' and po_count > 0:
+                blp_val = (ip_val * nod) - po_count
+                if blp_val < 0:
+                    blp_val = 0
+                
+                if ip_val > 0:
+                    dlp_val = nod - (po_count / ip_val)
+                else:
+                    dlp_val = nod
+                
+                if dlp_val < 0:
+                    dlp_val = 0
+            else:
+                blp_val = ip_val * nod
+                dlp_val = nod
+                
+            blp_tg[i] = blp_val
+            dlp_tg[i] = dlp_val
+            
+        # Apply zeroes to rows excluded by PD, SM_SM, or Non_Opp
+        blp_tg = np.where(excl, 0.0, blp_tg)
+        dlp_tg = np.where(excl, 0.0, dlp_tg)
         
         def sla(lookup):
             return np.where(inc, per_row(lookup), 0)
@@ -2437,229 +2484,209 @@ ORDER BY
             self.log_message(f"\nSaving final Excel...!!")
             self.log_message(f"Filename: {os.path.basename(output_filename)}")
             
+            # Prepare Hes Summary Data
+            hes_summary = []
+            
+            for hes_name, hes_df in hes_wise_data.items():
+                hes_display_name = hes_name.replace('SLA_', '').replace('_Raw', '')
+                total_meters = len(hes_df)
+                
+                if self.exclusion_enabled:
+                    pdc_count = len(hes_df[hes_df['Exclusion_Type'] == 'PD'])
+                    non_opp_count = len(hes_df[hes_df['Exclusion_Type'] == 'Non_Opp'])
+                    sm_sm_count = len(hes_df[hes_df['Exclusion_Type'] == 'SM_SM'])
+                    power_off_count = len(hes_df[hes_df['Exclusion_Type'] == 'Power_OFF'])
+                    eligible_meters = total_meters - (pdc_count + non_opp_count + sm_sm_count)
+                else:
+                    pdc_count = 0
+                    non_opp_count = 0
+                    sm_sm_count = len(hes_df[hes_df['Exclusion_Type'] == 'SM_SM'])
+                    power_off_count = len(hes_df[hes_df['Exclusion_Type'] == 'Power_OFF'])
+                    eligible_meters = total_meters
+                
+                active_df = hes_df[hes_df['Main_Ex_Flag'] == '0']
+                
+                blp_tg = active_df['BLP_Tg'].sum() if not active_df.empty else 0
+                blp_8 = active_df['BLP_H8_SLA'].sum() if not active_df.empty else 0
+                blp_12 = active_df['BLP_H12_SLA'].sum() if not active_df.empty else 0
+                blp_24 = active_df['BLP_H24_SLA'].sum() if not active_df.empty else 0
+                dlp_tg = active_df['DLP_Tg'].sum() if not active_df.empty else 0
+                dlp_24 = active_df['DLP_H24_SLA'].sum() if not active_df.empty else 0
+                bill_tg = active_df['Bill_Tg'].sum() if not active_df.empty else 0
+                bill_3 = active_df['Bill_h72_SLA'].sum() if not active_df.empty else 0
+                bill_7 = active_df['Bill_h168_SLA'].sum() if not active_df.empty else 0
+                
+                pct_blp_8 = (blp_8 / blp_tg * 100) if blp_tg > 0 else 0
+                pct_blp_12 = (blp_12 / blp_tg * 100) if blp_tg > 0 else 0
+                pct_blp_24 = (blp_24 / blp_tg * 100) if blp_tg > 0 else 0
+                pct_dlp_24 = (dlp_24 / dlp_tg * 100) if dlp_tg > 0 else 0
+                pct_bill_3 = (bill_3 / bill_tg * 100) if bill_tg > 0 else 0
+                pct_bill_7 = (bill_7 / bill_tg * 100) if bill_tg > 0 else 0
+                
+                if self.exclusion_enabled:
+                    summary_row = {
+                        'HES': hes_display_name,
+                        'Mtr_Qty': total_meters,
+                        'PDC': pdc_count,
+                        'Non_Opp': non_opp_count,
+                        'SM_SM': sm_sm_count,
+                        'Power_OFF': power_off_count,
+                        'Eligible_meters': eligible_meters,
+                        'BLP_Tg': blp_tg,
+                        'BLP_8': blp_8,
+                        'BLP_12': blp_12,
+                        'BLP_24': blp_24,
+                        'DLP_Tg': dlp_tg,
+                        'DLP_24': dlp_24,
+                        'Bill_Tg': bill_tg,
+                        'Bill_3': bill_3,
+                        'Bill_7': bill_7,
+                        '%BLP_8': pct_blp_8,
+                        '%BLP_12': pct_blp_12,
+                        '%BLP_24': pct_blp_24,
+                        '%DLP_24': pct_dlp_24,
+                        '%Bill_3': pct_bill_3,
+                        '%Bill_7': pct_bill_7
+                    }
+                else:
+                    summary_row = {
+                        'HES': hes_display_name,
+                        'Mtr_Qty': total_meters,
+                        'SM_SM': sm_sm_count,
+                        'Power_OFF': power_off_count,
+                        'Eligible_meters': eligible_meters,
+                        'BLP_Tg': blp_tg,
+                        'BLP_8': blp_8,
+                        'BLP_12': blp_12,
+                        'BLP_24': blp_24,
+                        'DLP_Tg': dlp_tg,
+                        'DLP_24': dlp_24,
+                        'Bill_Tg': bill_tg,
+                        'Bill_3': bill_3,
+                        'Bill_7': bill_7,
+                        '%BLP_8': pct_blp_8,
+                        '%BLP_12': pct_blp_12,
+                        '%BLP_24': pct_blp_24,
+                        '%DLP_24': pct_dlp_24,
+                        '%Bill_3': pct_bill_3,
+                        '%Bill_7': pct_bill_7
+                    }
+                
+                hes_summary.append(summary_row)
+            
+            if hes_summary:
+                if self.exclusion_enabled:
+                    all_hes_row = {
+                        'HES': 'All HES -',
+                        'Mtr_Qty': sum(row['Mtr_Qty'] for row in hes_summary),
+                        'PDC': sum(row['PDC'] for row in hes_summary),
+                        'Non_Opp': sum(row['Non_Opp'] for row in hes_summary),
+                        'SM_SM': sum(row['SM_SM'] for row in hes_summary),
+                        'Power_OFF': sum(row['Power_OFF'] for row in hes_summary),
+                        'Eligible_meters': sum(row['Eligible_meters'] for row in hes_summary),
+                        'BLP_Tg': sum(row['BLP_Tg'] for row in hes_summary),
+                        'BLP_8': sum(row['BLP_8'] for row in hes_summary),
+                        'BLP_12': sum(row['BLP_12'] for row in hes_summary),
+                        'BLP_24': sum(row['BLP_24'] for row in hes_summary),
+                        'DLP_Tg': sum(row['DLP_Tg'] for row in hes_summary),
+                        'DLP_24': sum(row['DLP_24'] for row in hes_summary),
+                        'Bill_Tg': sum(row['Bill_Tg'] for row in hes_summary),
+                        'Bill_3': sum(row['Bill_3'] for row in hes_summary),
+                        'Bill_7': sum(row['Bill_7'] for row in hes_summary),
+                    }
+                else:
+                    all_hes_row = {
+                        'HES': 'All HES -',
+                        'Mtr_Qty': sum(row['Mtr_Qty'] for row in hes_summary),
+                        'SM_SM': sum(row['SM_SM'] for row in hes_summary),
+                        'Power_OFF': sum(row['Power_OFF'] for row in hes_summary),
+                        'Eligible_meters': sum(row['Eligible_meters'] for row in hes_summary),
+                        'BLP_Tg': sum(row['BLP_Tg'] for row in hes_summary),
+                        'BLP_8': sum(row['BLP_8'] for row in hes_summary),
+                        'BLP_12': sum(row['BLP_12'] for row in hes_summary),
+                        'BLP_24': sum(row['BLP_24'] for row in hes_summary),
+                        'DLP_Tg': sum(row['DLP_Tg'] for row in hes_summary),
+                        'DLP_24': sum(row['DLP_24'] for row in hes_summary),
+                        'Bill_Tg': sum(row['Bill_Tg'] for row in hes_summary),
+                        'Bill_3': sum(row['Bill_3'] for row in hes_summary),
+                        'Bill_7': sum(row['Bill_7'] for row in hes_summary),
+                    }
+                
+                all_hes_row['%BLP_8'] = (all_hes_row['BLP_8'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
+                all_hes_row['%BLP_12'] = (all_hes_row['BLP_12'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
+                all_hes_row['%BLP_24'] = (all_hes_row['BLP_24'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
+                all_hes_row['%DLP_24'] = (all_hes_row['DLP_24'] / all_hes_row['DLP_Tg'] * 100) if all_hes_row['DLP_Tg'] > 0 else 0
+                all_hes_row['%Bill_3'] = (all_hes_row['Bill_3'] / all_hes_row['Bill_Tg'] * 100) if all_hes_row['Bill_Tg'] > 0 else 0
+                all_hes_row['%Bill_7'] = (all_hes_row['Bill_7'] / all_hes_row['Bill_Tg'] * 100) if all_hes_row['Bill_Tg'] > 0 else 0
+                
+                hes_summary.append(all_hes_row)
+            
+            hes_summary_df = pd.DataFrame(hes_summary)
+            
+            # Create SDO Summary DataFrame
+            sdo_df = self.create_sdo_wise_summary(hes_wise_data, month_year, sat_numbers)
+            
+            # Ensure RC_DC Data has sheet name or prepare it
+            if 'Excl_flag' in rc_dc_data.columns:
+                rc_dc_data['Occ_datetime'] = pd.to_datetime(rc_dc_data.get('Occ_datetime', pd.Series()), errors='coerce')
+                rc_dc_data['Res_datetime'] = pd.to_datetime(rc_dc_data.get('Res_datetime', pd.Series()), errors='coerce')
+            
+            # Enforce sheet order exactly as requested
+            sheets_to_write = [
+                ('Hes_Wise_Summary', hes_summary_df),
+                ('SDO_Wise_Summary', sdo_df),
+                ('RC_DC_Details', rc_dc_data),
+                ('SLA_BCITS_Raw', hes_wise_data.get('SLA_BCITS_Raw', pd.DataFrame())),
+                ('SLA_Cyan_Raw', hes_wise_data.get('SLA_Cyan_Raw', pd.DataFrame())),
+                ('SLA_Crystal_Raw', hes_wise_data.get('SLA_Crystal_Raw', pd.DataFrame())),
+                ('Power_OFF_RAW', power_off_data),
+                ('SM_to_SM', sm_to_sm_data),
+                ('PDC_RAW', pdrc_data),
+                ('Non_Opp_Raw', non_opp_data)
+            ]
+            
             with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
-                hes_summary = []
+                workbook = writer.book
                 
-                for hes_name, hes_df in hes_wise_data.items():
-                    hes_display_name = hes_name.replace('SLA_', '').replace('_Raw', '')
-                    total_meters = len(hes_df)
-                    
-                    if self.exclusion_enabled:
-                        pdc_count = len(hes_df[hes_df['Exclusion_Type'] == 'PD'])
-                        non_opp_count = len(hes_df[hes_df['Exclusion_Type'] == 'Non_Opp'])
-                        sm_sm_count = len(hes_df[hes_df['Exclusion_Type'] == 'SM_SM'])
-                        power_off_count = len(hes_df[hes_df['Exclusion_Type'] == 'Power_OFF'])
-                        eligible_meters = total_meters - (pdc_count + non_opp_count + sm_sm_count)
-                    else:
-                        pdc_count = 0
-                        non_opp_count = 0
-                        sm_sm_count = 0
-                        power_off_count = len(hes_df[hes_df['Exclusion_Type'] == 'Power_OFF'])
-                        eligible_meters = total_meters
-                    
-                    if self.exclusion_enabled:
-                        active_df = hes_df[hes_df['Main_Ex_Flag'] == '0']
-                    else:
-                        active_df = hes_df
-                    
-                    blp_tg = active_df['BLP_Tg'].sum() if not active_df.empty else 0
-                    blp_8 = active_df['BLP_H8_SLA'].sum() if not active_df.empty else 0
-                    blp_12 = active_df['BLP_H12_SLA'].sum() if not active_df.empty else 0
-                    blp_24 = active_df['BLP_H24_SLA'].sum() if not active_df.empty else 0
-                    dlp_tg = active_df['DLP_Tg'].sum() if not active_df.empty else 0
-                    dlp_24 = active_df['DLP_H24_SLA'].sum() if not active_df.empty else 0
-                    bill_tg = active_df['Bill_Tg'].sum() if not active_df.empty else 0
-                    bill_3 = active_df['Bill_h72_SLA'].sum() if not active_df.empty else 0
-                    bill_7 = active_df['Bill_h168_SLA'].sum() if not active_df.empty else 0
-                    
-                    pct_blp_8 = (blp_8 / blp_tg * 100) if blp_tg > 0 else 0
-                    pct_blp_12 = (blp_12 / blp_tg * 100) if blp_tg > 0 else 0
-                    pct_blp_24 = (blp_24 / blp_tg * 100) if blp_tg > 0 else 0
-                    pct_dlp_24 = (dlp_24 / dlp_tg * 100) if dlp_tg > 0 else 0
-                    pct_bill_3 = (bill_3 / bill_tg * 100) if bill_tg > 0 else 0
-                    pct_bill_7 = (bill_7 / bill_tg * 100) if bill_tg > 0 else 0
-                    
-                    if self.exclusion_enabled:
-                        summary_row = {
-                            'HES': hes_display_name,
-                            'Mtr_Qty': total_meters,
-                            'PDC': pdc_count,
-                            'Non_Opp': non_opp_count,
-                            'SM_SM': sm_sm_count,
-                            'Power_OFF': power_off_count,
-                            'Eligible_meters': eligible_meters,
-                            'BLP_Tg': blp_tg,
-                            'BLP_8': blp_8,
-                            'BLP_12': blp_12,
-                            'BLP_24': blp_24,
-                            'DLP_Tg': dlp_tg,
-                            'DLP_24': dlp_24,
-                            'Bill_Tg': bill_tg,
-                            'Bill_3': bill_3,
-                            'Bill_7': bill_7,
-                            '%BLP_8': pct_blp_8,
-                            '%BLP_12': pct_blp_12,
-                            '%BLP_24': pct_blp_24,
-                            '%DLP_24': pct_dlp_24,
-                            '%Bill_3': pct_bill_3,
-                            '%Bill_7': pct_bill_7
-                        }
-                    else:
-                        summary_row = {
-                            'HES': hes_display_name,
-                            'Mtr_Qty': total_meters,
-                            'Power_OFF': power_off_count,
-                            'Eligible_meters': eligible_meters,
-                            'BLP_Tg': blp_tg,
-                            'BLP_8': blp_8,
-                            'BLP_12': blp_12,
-                            'BLP_24': blp_24,
-                            'DLP_Tg': dlp_tg,
-                            'DLP_24': dlp_24,
-                            'Bill_Tg': bill_tg,
-                            'Bill_3': bill_3,
-                            'Bill_7': bill_7,
-                            '%BLP_8': pct_blp_8,
-                            '%BLP_12': pct_blp_12,
-                            '%BLP_24': pct_blp_24,
-                            '%DLP_24': pct_dlp_24,
-                            '%Bill_3': pct_bill_3,
-                            '%Bill_7': pct_bill_7
-                        }
-                    
-                    hes_summary.append(summary_row)
+                # Create a format for 3 decimal percentage without the % sign (as a number)
+                # Wait, the user wants "96.757%". So if the value is 96.757, they want the string/symbol.
+                # If they want it as 96.757%, in Excel we can use a custom number format.
+                percent_format = workbook.add_format({'num_format': '0.000"%"'})
                 
-                if hes_summary:
-                    if self.exclusion_enabled:
-                        all_hes_row = {
-                            'HES': 'All HES -',
-                            'Mtr_Qty': sum(row['Mtr_Qty'] for row in hes_summary),
-                            'PDC': sum(row['PDC'] for row in hes_summary),
-                            'Non_Opp': sum(row['Non_Opp'] for row in hes_summary),
-                            'SM_SM': sum(row['SM_SM'] for row in hes_summary),
-                            'Power_OFF': sum(row['Power_OFF'] for row in hes_summary),
-                            'Eligible_meters': sum(row['Eligible_meters'] for row in hes_summary),
-                            'BLP_Tg': sum(row['BLP_Tg'] for row in hes_summary),
-                            'BLP_8': sum(row['BLP_8'] for row in hes_summary),
-                            'BLP_12': sum(row['BLP_12'] for row in hes_summary),
-                            'BLP_24': sum(row['BLP_24'] for row in hes_summary),
-                            'DLP_Tg': sum(row['DLP_Tg'] for row in hes_summary),
-                            'DLP_24': sum(row['DLP_24'] for row in hes_summary),
-                            'Bill_Tg': sum(row['Bill_Tg'] for row in hes_summary),
-                            'Bill_3': sum(row['Bill_3'] for row in hes_summary),
-                            'Bill_7': sum(row['Bill_7'] for row in hes_summary),
-                        }
-                    else:
-                        all_hes_row = {
-                            'HES': 'All HES -',
-                            'Mtr_Qty': sum(row['Mtr_Qty'] for row in hes_summary),
-                            'Power_OFF': sum(row['Power_OFF'] for row in hes_summary),
-                            'Eligible_meters': sum(row['Eligible_meters'] for row in hes_summary),
-                            'BLP_Tg': sum(row['BLP_Tg'] for row in hes_summary),
-                            'BLP_8': sum(row['BLP_8'] for row in hes_summary),
-                            'BLP_12': sum(row['BLP_12'] for row in hes_summary),
-                            'BLP_24': sum(row['BLP_24'] for row in hes_summary),
-                            'DLP_Tg': sum(row['DLP_Tg'] for row in hes_summary),
-                            'DLP_24': sum(row['DLP_24'] for row in hes_summary),
-                            'Bill_Tg': sum(row['Bill_Tg'] for row in hes_summary),
-                            'Bill_3': sum(row['Bill_3'] for row in hes_summary),
-                            'Bill_7': sum(row['Bill_7'] for row in hes_summary),
-                        }
-                    
-                    all_hes_row['%BLP_8'] = (all_hes_row['BLP_8'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
-                    all_hes_row['%BLP_12'] = (all_hes_row['BLP_12'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
-                    all_hes_row['%BLP_24'] = (all_hes_row['BLP_24'] / all_hes_row['BLP_Tg'] * 100) if all_hes_row['BLP_Tg'] > 0 else 0
-                    all_hes_row['%DLP_24'] = (all_hes_row['DLP_24'] / all_hes_row['DLP_Tg'] * 100) if all_hes_row['DLP_Tg'] > 0 else 0
-                    all_hes_row['%Bill_3'] = (all_hes_row['Bill_3'] / all_hes_row['Bill_Tg'] * 100) if all_hes_row['Bill_Tg'] > 0 else 0
-                    all_hes_row['%Bill_7'] = (all_hes_row['Bill_7'] / all_hes_row['Bill_Tg'] * 100) if all_hes_row['Bill_Tg'] > 0 else 0
-                    
-                    hes_summary.append(all_hes_row)
-                
-                hes_summary_df = pd.DataFrame(hes_summary)
-                
-                pct_columns = ['%BLP_8', '%BLP_12', '%BLP_24', '%DLP_24', '%Bill_3', '%Bill_7']
-                for col in pct_columns:
-                    if col in hes_summary_df.columns:
-                        hes_summary_df[col] = hes_summary_df[col].apply(lambda x: f"{x:.3f}%" if pd.notna(x) else "0.00%")
-                
-                if not hes_summary_df.empty:
-                    hes_summary_df.to_excel(writer, sheet_name='Hes_Wise_Summary', index=False)
-                    self.log_message("  Created Hes_Wise_Summary sheet")
-                
-                # Only create SDO_Wise_Summary if Exclusion is YES
-                if self.exclusion_enabled:
-                    sdo_summary_df = self.create_sdo_wise_summary(hes_wise_data, month_year, sat_numbers)
-                    if not sdo_summary_df.empty:
-                        sdo_summary_df.to_excel(writer, sheet_name='SDO_Wise_Summary', index=False)
-                        self.log_message("  Created SDO_Wise_Summary sheet")
-                
-                # Write RC_DC sheet (always included)
-                if not rc_dc_data.empty:
-                    rc_dc_data.to_excel(writer, sheet_name='RC_DC', index=False)
-                    self.log_message("  Created RC_DC sheet")
-                
-                # Write SM_to_SM sheet (always included)
-                if not sm_to_sm_data.empty:
-                    sm_to_sm_data.to_excel(writer, sheet_name='SM_to_SM', index=False)
-                    self.log_message("  Created SM_to_SM sheet")
-                
-                # Write SLA_BCITS_Raw, SLA_Cyan_Raw, SLA_Crystal_Raw
-                for sheet_name, sheet_data in hes_wise_data.items():
-                    if 'BU' in sheet_data.columns:
-                        sheet_data['BU'] = sheet_data['BU'].astype(str).str.zfill(4)
-                    if 'KNO' in sheet_data.columns:
-                        sheet_data['KNO'] = sheet_data['KNO'].astype(str)
-                    sheet_data.to_excel(writer, sheet_name=sheet_name, index=False)
-                
-                # Write Power_OFF_RAW (always included)
-                if not power_off_data.empty:
-                    power_off_data.to_excel(writer, sheet_name='Power_OFF_RAW', index=False)
-                    self.log_message("  Created Power_OFF_RAW sheet")
-                
-                # Only write other exclusion-related sheets if Exclusion is YES
-                if self.exclusion_enabled:
-                    if not pdrc_data.empty:
-                        pdrc_data.to_excel(writer, sheet_name='PDC_RAW', index=False)
-                        self.log_message("  Created PDC_RAW sheet")
-                    
-                    if not non_opp_data.empty:
-                        non_opp_data.to_excel(writer, sheet_name='Non_Opp_Raw', index=False)
-                        self.log_message("  Created Non_Opp_Raw sheet")
+                for sheet_name, df in sheets_to_write:
+                    if df is not None:
+                        sheet_name_safe = sheet_name[:31]
+                        df.to_excel(writer, sheet_name=sheet_name_safe, index=False)
+                        
+                        # Apply the format to the percentage columns if this is the Hes_Wise_Summary sheet
+                        if sheet_name_safe == 'Hes_Wise_Summary':
+                            worksheet = writer.sheets[sheet_name_safe]
+                            pct_cols = ['%BLP_8', '%BLP_12', '%BLP_24', '%DLP_24', '%Bill_3', '%Bill_7']
+                            for col_name in pct_cols:
+                                if col_name in df.columns:
+                                    col_idx = df.columns.get_loc(col_name)
+                                    # Apply to all rows (1 to len(df))
+                                    worksheet.set_column(col_idx, col_idx, None, percent_format)
+                                    
+                        self.log_message(f"  Saved {sheet_name_safe} sheet with {len(df)} records")
             
-            self.log_message("\n" + "=" * 60)
-            self.log_message(f"✓ Final Summary Process completed successfully!")
-            self.log_message(f"Output saved to: {output_filename}")
-            self.log_message("=" * 60)
-            
-            messagebox.showinfo("Success", f"Final Summary Process completed successfully!\n\nOutput saved to:\n{output_filename}")
+            self.log_message(f"\n✓ Final Excel created successfully: {output_filename}")
+            messagebox.showinfo("Success", f"Final Excel created:\n{os.path.basename(output_filename)}")
             
         except Exception as e:
-            self.log_message(f"Error in final summary process: {str(e)}")
             import traceback
-            traceback.print_exc()
-            messagebox.showerror("Error", f"Failed to run final summary process:\n{str(e)}")
+            error_details = traceback.format_exc()
+            self.log_message(f"\n✗ Error creating final Excel: {str(e)}")
+            self.log_message(f"Details: {error_details}")
+            messagebox.showerror("Error", f"Failed to create final Excel:\n{str(e)}")
     
     def run_final_process(self):
-        """Run the final summary process"""
-        if self.final_summary_var.get() == "NO":
-            self.log_message("Final summary process cancelled.")
-            return
+        """Run the final process in a separate thread"""
+        self.run_final_button.config(state=tk.DISABLED)
+        self.log_message("\n" + "=" * 60)
+        self.log_message("Starting Final Summary Process...")
+        self.log_message("=" * 60)
         
-        # Check required files based on exclusion setting
-        if self.exclusion_enabled:
-            if not all([self.satc_file_path, self.blp_file_path, self.dlp_file_path, self.billing_file_path, 
-                       self.pdrc_file_path, self.sm_to_sm_file_path, self.non_opp_file_path, self.power_off_file_path, 
-                       self.rc_dc_file_path]):
-                self.log_message("Error: Please select all required files for the final summary.")
-                messagebox.showerror("Error", "Please select all required files for the final summary.\n\nRequired files:\n- SATC RAW\n- BLP RAW\n- DLP RAW\n- BILLING RAW\n- PDRC RAW\n- SM to SM RAW\n- Non Opp RAW\n- Power OFF RAW\n- RC_DC RAW")
-                return
-        else:
-            if not all([self.satc_file_path, self.blp_file_path, self.dlp_file_path, self.billing_file_path, 
-                       self.power_off_file_path, self.rc_dc_file_path, self.sm_to_sm_file_path]):
-                self.log_message("Error: Please select all required files for the final summary.")
-                messagebox.showerror("Error", "Please select all required files for the final summary.\n\nRequired files:\n- SATC RAW\n- BLP RAW\n- DLP RAW\n- BILLING RAW\n- Power OFF RAW\n- RC_DC RAW\n- SM to SM RAW")
-                return
-        
-        process_thread = threading.Thread(target=self.create_final_excel)
-        process_thread.daemon = True
-        process_thread.start()
+        final_thread = threading.Thread(target=self.create_final_excel)
+        final_thread.daemon = True
+        final_thread.start()
